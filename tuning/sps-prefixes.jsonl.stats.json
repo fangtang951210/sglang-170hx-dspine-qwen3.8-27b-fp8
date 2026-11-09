@@ -1,0 +1,50 @@
+[
+ {
+  "row": 1,
+  "kind": "art",
+  "tokens": 8984,
+  "task": "\nSummarize the key points above in detai"
+ },
+ {
+  "row": 2,
+  "kind": "code",
+  "tokens": 8984,
+  "task": "\nExplain what this code does, its archit"
+ },
+ {
+  "row": 3,
+  "kind": "mix",
+  "tokens": 13984,
+  "task": "\n用中文详细总结上面的要点,并给出你的评价。"
+ },
+ {
+  "row": 4,
+  "kind": "code",
+  "tokens": 19984,
+  "task": "\nWrite unit tests for the most important"
+ },
+ {
+  "row": 5,
+  "kind": "mix",
+  "tokens": 31984,
+  "task": "\nReview the material above carefully, fi"
+ },
+ {
+  "row": 6,
+  "kind": "code",
+  "tokens": 47984,
+  "task": "\nContinue the implementation in the same"
+ },
+ {
+  "row": 7,
+  "kind": "art",
+  "tokens": 63984,
+  "task": "\nSummarize the key points above in detai"
+ },
+ {
+  "row": 8,
+  "kind": "mix",
+  "tokens": 114984,
+  "task": "\nSummarize the key points above in detai"
+ }
+]

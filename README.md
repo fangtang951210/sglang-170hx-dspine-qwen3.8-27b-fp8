@@ -1,8 +1,8 @@
 # sglang + DSpine(CMP 170HX / SM80 / FP8)复现 Qwen3.8-27B 投机解码全记录:部署踩坑 → 测速 → 发现长上下文滑窗掩码 bug → 修复 → 数据
 
-> 关键词:sglang · DSpine · speculative decoding · CMP 170HX · SM80 / Ampere · FP8 · Qwen3.8-27B · long context · sliding window bug
+> 关键词:sglang · DSpine · speculative decoding · CMP 170HX · SM80 / Ampere · FP8 · Qwen3.8-27B · long context · sliding window bug · SPS tuning (negative result)
 
-一张矿卡(NVIDIA CMP 170HX,SM80/Ampere,64G 显存)上用 **FP8 底模**复现腾讯 DSpine 并行起草投机解码的完整实战记录:sglang 0.5.20→0.5.22 严格升级 → 八枪闯过五关部署成功 → 测速发现 decode 全线崩到裸跑以下 → 五负载裁决+外部调研锁定方向 → **定位到 sglang 0.5.22 + SM80 上 FA 滑窗掩码分支输出垃圾的确定性 bug(边界=草稿 config 的 `sliding_window: 8192`)→ 两处同步改 262144 修复,长上下文全档恢复**。全部数据同机同工具实测,含原始 JSONL 与真实 diff,欢迎复现。
+一张矿卡(NVIDIA CMP 170HX,SM80/Ampere,64G 显存)上用 **FP8 底模**复现腾讯 DSpine 并行起草投机解码的完整实战记录:sglang 0.5.20→0.5.22 严格升级 → 八枪闯过五关部署成功 → 测速发现 decode 全线崩到裸跑以下 → 五负载裁决+外部调研锁定方向 → **定位到 sglang 0.5.22 + SM80 上 FA 滑窗掩码分支输出垃圾的确定性 bug(边界=草稿 config 的 `sliding_window: 8192`)→ 两处同步改 262144 修复,长上下文全档恢复**。全部数据同机同工具实测,含原始 JSONL 与真实 diff,欢迎复现。随后按官方流程实测 SPS 调优表:三档负载提升全部 <5%,判定负结果已回退(负结果也是数据,见下文专节)。
 
 ## 测速:网页测速工具 v2.2 本体实测(单流,短上下文梯度)
 
@@ -41,6 +41,15 @@
 
 真实 diff 与完整证据链见 [`patch/`](patch/) 与 [`docs/dspine-longctx-fix.md`](docs/dspine-longctx-fix.md)。已排除的假修复:`--speculative-draft-window-size`(DSPINE 硬拒)、`--chunked-prefill-size 16384`(OOM)、deterministic/num_splits=1(无效)。
 
+## SPS 调优(负结果,已回退)
+
+修完长上下文后,按 DSpine 官方 `tune_sps.py` 流程把 SPS 验证宽度表完整调了一遍(约 3 小时全程,负结果如实收录,同硬件同学可免重试):
+
+- **结论:三档均无提升,已回退**。调出的表对三档真实负载 decode 提升全部 <5%——单流 8K **-2.0%**、单流 100K **+3.3%**、4×56K 纯排程噪声(该档 decode batch=3 时选中策略=宽 16,与无表完全等价)。按判定规则(任一档 ≥+5% 才保留)回退,终态恢复无表原配置,health 200。
+- **原因分析**:本机 mamba 16 槽 → 实际并发上限 3,调优只能扫 `--batch-sizes 1 2 3` 的窄区间(官方默认 1–8 在本部署直接报错,bs≥4 生产也到不了);且本负载草稿接受长度本就 ~3.9,16 宽整块验证浪费不大,收窄无肉——官方甜区(小宽度高收益)在这台机不存在。另:310K token 校准语料池超 KV 缓存容量,测量墙钟被 prefill 主导,宽度间差异进一步被稀释。
+- **适用条件**:换更大显存卡(mamba 槽↑、并发>3)或负载形态改变(温度采样为主、语料明显变化)后,可按同流程重调再试。
+- 完整报告:[`docs/dspine-sps-tuning.md`](docs/dspine-sps-tuning.md);全部原始产物(SPS 表 JSON、校准语料、逐候选测量原始数据、服务日志、前后 bench):[`tuning/`](tuning/),前测速对照行已并入 [`data/bench-tool-results.jsonl`](data/bench-tool-results.jsonl)(tag `sps-前-*` / `sps-后-*`)。
+
 ## 环境
 
 **硬件**:NVIDIA CMP 170HX(解锁 64G 显存)· GA100/SM 8.0 · HBM2e ~1493 GB/s · Xeon E5-2686 v4 · Ubuntu 24.04 · 驱动 610.43.03
@@ -61,10 +70,11 @@ transformers==5.19.0  triton==3.8.0        Python 3.12
 
 | 路径 | 内容 |
 |---|---|
-| [`docs/`](docs/) | 11 份报告原文(时间序):调研方案 → 模型下载验收 → 部署日志(五关) → DFlash2 基线测速 → DSpine 修复前测速(崩盘) → 裸跑 AR 对照 → 真实负载数据 → 五负载裁决(verdict2) → 外部调研(根因 Top3+官方口径) → **长上下文修复报告** → 测速工具填法 |
+| [`docs/`](docs/) | 12 份报告原文(时间序):调研方案 → 模型下载验收 → 部署日志(五关) → DFlash2 基线测速 → DSpine 修复前测速(崩盘) → 裸跑 AR 对照 → 真实负载数据 → 五负载裁决(verdict2) → 外部调研(根因 Top3+官方口径) → **长上下文修复报告** → 测速工具填法 → **SPS 调优(负结果)** |
+| [`tuning/`](tuning/) | SPS 调优全部原始产物(负结果):最终表 `dspine-sps-table.json` · 校准语料与构建脚本 · 调优器日志 · 逐候选测量原始数据(`runs/`)· 带表/终态无表服务日志 · 前后对比 bench 与 metrics 快照 |
 | [`patch/`](patch/) | 两枚真实 diff:长上下文滑窗修复(config+WINDOW 常量)· SM80 FP8 粗检索 BF16 回退 |
 | [`screenshots/`](screenshots/) | `final-benchmark-user.png` 用户实测截图 · `tool-howto-fullpage.png` / `tool-howto-closeup.png` 网页测速工具跑通与填法 |
-| [`data/bench-tool-results.jsonl`](data/bench-tool-results.jsonl) | 全程 91 行原始测速数据(DFlash2 基线 / DSpine 修复前后 / 裸跑 AR / 裁决 / 最终验证,tag 分段) |
+| [`data/bench-tool-results.jsonl`](data/bench-tool-results.jsonl) | 全程 97 行原始测速数据(DFlash2 基线 / DSpine 修复前后 / 裸跑 AR / 裁决 / 最终验证 / SPS 调优前后,tag 分段) |
 
 ## 已知限制(如实)
 
@@ -75,4 +85,4 @@ transformers==5.19.0  triton==3.8.0        Python 3.12
 
 ## 复现
 
-所有数字均为 2026-11-09 单机实测,原始数据、启动参数全文、验证方法与脚本口径都在本仓库;`patch/` 可直接应用。同硬件同学欢迎按 `docs/` 时间线复跑对照,对上游(sgl-project/sglang、Tencent/DSpine)报 issue 时可直接引用 `data/` 与 `patch/` 的证据链(边界=窗口值、窗口放大即愈、num_splits=1 无效)。
+所有数字均为 2026-11-09 单机实测,原始数据、启动参数全文、验证方法与脚本口径都在本仓库;`patch/` 可直接应用。同硬件同学欢迎按 `docs/` 时间线复跑对照,对上游(sgl-project/sglang、Tencent/DSpine)报 issue 时可直接引用 `data/` 与 `patch/` 的证据链(边界=窗口值、窗口放大即愈、num_splits=1 无效)。SPS 调优流程与判定口径见 [`tuning/README.md`](tuning/README.md)。

@@ -1,0 +1,4 @@
+sglang:spec_verify_calls_total{engine_type="unified",model_name="qwen3.8-27b"} 3.0
+sglang:spec_accept_length{engine_type="unified",model_name="qwen3.8-27b",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.0
+sglang:spec_accept_rate{engine_type="unified",model_name="qwen3.8-27b",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.0
+sglang:spec_cap_length{engine_type="unified",model_name="qwen3.8-27b",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.0
