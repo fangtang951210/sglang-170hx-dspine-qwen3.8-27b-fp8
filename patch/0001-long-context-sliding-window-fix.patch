@@ -1,0 +1,54 @@
+From: DSpine long-context sliding-window fix on SM80
+Subject: [PATCH 1/2] Disable draft sliding window (8192 -> 262144) to fix long-context collapse
+
+Root cause: with seq > 8192 the FA sliding-window mask branch activates and
+produces garbage for this draft on sglang 0.5.22 + SM80 (sgl-kernel fa3
+path); collapse boundary moves with the window value (see patch/README.md).
+Window >= context length means the mask branch never activates, i.e. plain
+causal attention, which is verified correct. Lossless per DSpine paper /
+MLX port (draft uses absolute positions + relative rope; windowing exists
+only to save compute).
+
+Two changes, applied together (plugin startup validation ties them):
+
+(1) Draft config copy: sliding_window 8192 -> 262144 (= max_position_embeddings).
+    Zero-copy layout instead of duplicating the 4.05 GB draft:
+
+      qwen3.8-27b-dspine-b16-fullctx/
+      ├── config.json          # edited copy (the diff below)
+      ├── model.safetensors -> /path/to/qwen3.8-27b-dspine-b16/model.safetensors
+      ├── LICENSE            -> /path/to/qwen3.8-27b-dspine-b16/LICENSE
+      └── README.md          -> /path/to/qwen3.8-27b-dspine-b16/README.md
+
+    Then point --speculative-draft-model-path at this directory.
+
+--- a/qwen3.8-27b-dspine-b16/config.json  (original: tencent/Qwen3.8-27B-DSpine-b16)
++++ b/qwen3.8-27b-dspine-b16-fullctx/config.json
+@@ -90,10 +90,10 @@
+   },
+   "rope_scaling": null,
+   "rope_theta": 10000000,
+-  "sliding_window": 8192,
++  "sliding_window": 262144,
+   "tie_word_embeddings": false,
+   "torch_dtype": "bfloat16",
+   "use_cache": true,
+   "use_sliding_window": true,
+   "vocab_size": 248320
+
+(2) Plugin constant must match the config copy (startup validation reads it):
+
+--- a/sglang_dspine/layers/attention.py
++++ b/sglang_dspine/layers/attention.py
+@@ -1,6 +1,6 @@
+ """DSpine serving on SGLang 0.5.22."""
+
+-WINDOW = 8192
++WINDOW = 262144
+ BLOCK_SIZE = 16
+ NUM_LAYERS = 5
+ BACKENDS = frozenset(("fa3",))
+
+Effect (bench_lctx2.py, T=0, single stream, code corpus):
+  9229 tok:  accept 1.02 / decode ~22  ->  accept 13.4-14.6 / decode 218
+  100K tok:  accept ~1.0 / decode 23.9 ->  accept 7.9-8.2 / decode 129-132

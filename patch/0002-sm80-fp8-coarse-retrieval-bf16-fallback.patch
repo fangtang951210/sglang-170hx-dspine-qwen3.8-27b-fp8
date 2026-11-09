@@ -1,0 +1,55 @@
+From: SM80 adaptation for DSpine draft LM-head FP8 coarse retrieval
+Subject: [PATCH 2/2] Gate FP8 coarse retrieval on compute capability >= 8.9
+
+torch._scaled_mm requires compute capability >= 8.9 (SM89/SM90+) or ROCm
+MI300+; on CMP 170HX (SM80/GA100) CUDA-graph capture crashes with
+"RuntimeError: torch._scaled_mm is only supported on CUDA devices with
+compute capability >= 9.0 or 8.9". Fall back to a plain BF16 matmul for
+the coarse candidate pass. Numerically safe: final scores always come
+from the original BF16 head in rescore(); the coarse pass only narrows
+the candidate set (BF16 coarse is more accurate than FP8, just slower —
+~1-2 ms/step for the 120 coarse rows involved, measured negligible).
+
+Applies to the editable plugin install (git clone of Tencent/DSpine).
+Original file preserved as coarse.py.orig.
+
+--- a/sglang_dspine/layers/fp8/coarse.py
++++ b/sglang_dspine/layers/fp8/coarse.py
+@@ -39,18 +39,25 @@ class FullVFP8Coarse:
+
+     def retrieve_and_rescore(self, hidden, *, fi_top_k, gather_ops):
+         torch = self.torch
+-        scale = _scale(torch, hidden)
+-        quantized = _quantize(torch, hidden, scale)
+-        coarse = torch.ops.aten._scaled_mm.default(
+-            quantized,
+-            self.weight8_t,
+-            scale,
+-            self.weight_scale,
+-            bias=None,
+-            scale_result=None,
+-            out_dtype=torch.bfloat16,
+-            use_fast_accum=False,
+-        )
++        # SM80 (compute capability < 8.9) has no torch._scaled_mm: fall back to
++        # a plain BF16 matmul for the coarse candidate pass. Numerics are safe:
++        # final scores always come from the original BF16 head in rescore().
++        cap = torch.cuda.get_device_capability(hidden.device)
++        if cap[0] * 10 + cap[1] < 89:
++            coarse = torch.matmul(hidden, self.original_weight.t())
++        else:
++            scale = _scale(torch, hidden)
++            quantized = _quantize(torch, hidden, scale)
++            coarse = torch.ops.aten._scaled_mm.default(
++                quantized,
++                self.weight8_t,
++                scale,
++                self.weight_scale,
++                bias=None,
++                scale_result=None,
++                out_dtype=torch.bfloat16,
++                use_fast_accum=False,
++            )
+         ids = fi_top_k(coarse, 128, sorted=False, dsa_graph_safe=True)[1]
+         scores = gather_ops.rescore(torch, self.original_weight, ids, hidden)
+         return gather_ops.select16(torch, scores, ids), ids, scores
