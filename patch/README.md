@@ -6,8 +6,10 @@
 |---|---|---|---|---|
 | 1 | [0001-long-context-sliding-window-fix.patch](0001-long-context-sliding-window-fix.patch) | 草稿 `config.json` 副本 + 插件 `sglang_dspine/layers/attention.py` | seq>8192 后草稿提案全废(accept≈1.0、decode 崩到裸跑以下) | **核心修复** |
 | 2 | [0002-sm80-fp8-coarse-retrieval-bf16-fallback.patch](0002-sm80-fp8-coarse-retrieval-bf16-fallback.patch) | 插件 `sglang_dspine/layers/fp8/coarse.py` | `torch._scaled_mm` 要求算力 ≥8.9,SM80 无此内核,启动即崩 | SM80 适配 |
+| 3 | [yarn-draft-config.md](yarn-draft-config.md) | 草稿 `config.json` 副本(`rope_parameters` 三行) | 256K 输入下草稿 rope 全程 85 倍外推,accept 卡 3.3 不上 | **核心修复(256K)** |
+| 4 | [launch_dspine_256k.sh](launch_dspine_256k.sh) | 启动脚本全文 | 256K 终态配置(mf 0.90+mamba8+chunked1024+skip-warmup,头部注释含全部迭代差异) | 终态配置 |
 
-应用顺序:先打 0002(否则服务起不来),再打 0001(否则长上下文废)。两处改动均在插件仓库 `~/DSpine`(editable 安装)内直接生效,改完重启服务。
+应用顺序:先打 0002(否则服务起不来),再打 0001(否则长上下文废),要上 256K 再按 0003 改草稿 config 副本并用 `launch_dspine_256k.sh` 启动(131072 日常档与 256K 档可共用同一草稿副本,yarn 对 100K 档零回退)。改动均在插件仓库 `~/DSpine`(editable 安装)与草稿 config 副本内直接生效,改完重启服务。
 
 ## 0001 长上下文滑窗修复(核心)
 
@@ -43,3 +45,7 @@ realtext 语料同样全档平坦无崩塌(100K:4.38 / 82.8)。
 **改法**:按算力门控——`cap < 8.9` 时粗检索退普通 BF16 matmul(`hidden @ original_weight.t()`),≥8.9 走原 FP8 路径不变。数值安全:最终分数永远出自 `rescore()` 的原始 BF16 head,粗检索只影响候选集,BF16 粗筛比 FP8 更准。代价:粗筛仅 max_bs×15=120 行,GA100 上 ~1-2ms/步,实测可忽略。原文件留档 `coarse.py.orig`。
 
 注意:`git pull` 升级插件会冲掉本地补丁,升级需重打或先提 PR 给上游。
+
+## 0003 · 256K 草稿 YARN rope 外推修复
+
+0001 修完滑窗后 256K 档接受率仍卡 3.3(100K 档 5.075),根因换人:草稿 rope 训练仅覆盖 ~3072 位置,262144 全程 85 倍外推。修复 = 草稿 config 副本 `rope_parameters` 三行 yarn 增量(factor 85.3333 = 262144/3072, orig 3072),**256K accept 恢复 5.075(=100K 档完全同值)、decode 74.3–82.6 tps,100K 档零回退**。两个坑一并记录:顶层 `rope_scaling` 字段是摆设(sglang 0.5.22 优先读 `rope_parameters`,写错地方静默不生效);窗口必须 ≥ 输入全长(131072/65536 实测全崩)。完整 diff、验证数据与说明见 [yarn-draft-config.md](yarn-draft-config.md),原始实验日志见 [`../experiments/`](../experiments/),报告见 [`../docs/dspine-256k-optimize.md`](../docs/dspine-256k-optimize.md)。

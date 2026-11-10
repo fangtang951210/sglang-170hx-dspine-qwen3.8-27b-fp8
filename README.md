@@ -1,8 +1,8 @@
-# sglang + DSpine(CMP 170HX / SM80 / FP8)复现 Qwen3.8-27B 投机解码全记录:部署踩坑 → 测速 → 发现长上下文滑窗掩码 bug → 修复 → 数据
+# sglang + DSpine(CMP 170HX / SM80 / FP8)复现 Qwen3.8-27B 投机解码全记录:部署踩坑 → 测速 → 发现长上下文滑窗掩码 bug → 修复 → 256K 达成 → 数据
 
-> 关键词:sglang · DSpine · speculative decoding · CMP 170HX · SM80 / Ampere · FP8 · Qwen3.8-27B · long context · sliding window bug · SPS tuning (negative result)
+> 关键词:sglang · DSpine · speculative decoding · CMP 170HX · SM80 / Ampere · FP8 · Qwen3.8-27B · long context · sliding window bug · **YARN rope extrapolation fix · 256K context** · SPS tuning (negative result)
 
-一张矿卡(NVIDIA CMP 170HX,SM80/Ampere,64G 显存)上用 **FP8 底模**复现腾讯 DSpine 并行起草投机解码的完整实战记录:sglang 0.5.20→0.5.22 严格升级 → 八枪闯过五关部署成功 → 测速发现 decode 全线崩到裸跑以下 → 五负载裁决+外部调研锁定方向 → **定位到 sglang 0.5.22 + SM80 上 FA 滑窗掩码分支输出垃圾的确定性 bug(边界=草稿 config 的 `sliding_window: 8192`)→ 两处同步改 262144 修复,长上下文全档恢复**。全部数据同机同工具实测,含原始 JSONL 与真实 diff,欢迎复现。随后按官方流程实测 SPS 调优表:三档负载提升全部 <5%,判定负结果已回退(负结果也是数据,见下文专节)。
+一张矿卡(NVIDIA CMP 170HX,SM80/Ampere,64G 显存)上用 **FP8 底模**复现腾讯 DSpine 并行起草投机解码的完整实战记录:sglang 0.5.20→0.5.22 严格升级 → 八枪闯过五关部署成功 → 测速发现 decode 全线崩到裸跑以下 → 五负载裁决+外部调研锁定方向 → **定位到 sglang 0.5.22 + SM80 上 FA 滑窗掩码分支输出垃圾的确定性 bug(边界=草稿 config 的 `sliding_window: 8192`)→ 两处同步改 262144 修复,长上下文全档恢复**。随后把上下文拉到 256K:先以 mf 0.90+mamba 8 槽+chunked 1024 硬挤进 KV 池 262688(代价:接受率 0.27→0.037、decode 腰斩),再**定位第二层根因——草稿 rope 训练仅覆盖 ~3072 位置、262144 全程 85 倍外推,草稿 config `rope_parameters` 写 YARN(factor 85.3333)修复,256K 接受率恢复 100K 甜点档水平(5.075)、decode 74–83 tps(投机收益 ×2)**。全部数据同机同工具实测,含原始 JSONL 与真实 diff,欢迎复现。SPS 调优按官方流程实测:三档负载提升全部 <5%,判定负结果已回退(负结果也是数据,见下文专节)。
 
 ## 测速:网页测速工具 v2.2 本体实测(单流,短上下文梯度)
 
@@ -41,6 +41,25 @@
 
 真实 diff 与完整证据链见 [`patch/`](patch/) 与 [`docs/dspine-longctx-fix.md`](docs/dspine-longctx-fix.md)。已排除的假修复:`--speculative-draft-window-size`(DSPINE 硬拒)、`--chunked-prefill-size 16384`(OOM)、deterministic/num_splits=1(无效)。
 
+## 256K 达成:第二层根因(YARN rope 外推)与终态
+
+滑窗修好后把上下文拉到 262144(显存硬挤:`mem-frac 0.90 + mamba 8 槽 + chunked-prefill 1024 + skip-server-warmup`,KV 池 262688,前序降级链六次尝试见 [`docs/dspine-256k-test.md`](docs/dspine-256k-test.md)),256K 档接受率仍崩(0.27→0.037,decode 腰斩到 51.8)。第二层根因与修复:
+
+1. **根因**:草稿 rope 训练仅覆盖 ~3072 位置,262144 输入下位置编码**全程 85 倍外推**,草稿与主模型分歧拉大、提案全废(窗口扫描证明不是滑窗问题:131072/65536 档 accept 均 1.025,262144 档 3.325,短窗口只会更崩);
+2. **修复**:草稿 config 副本 `rope_parameters` 写 YARN——`{"rope_type": "yarn", "factor": 85.3333, "original_max_position_embeddings": 3072}`(factor = 262144/3072)。**坑:顶层 `rope_scaling` 字段是摆设**,sglang 0.5.22 的 `get_rope_config` 优先读 `rope_parameters`,yarn 写错地方静默不生效;
+3. **效果**:256K 档 accept **5.075 / 0.272**(与 100K 甜点档完全同值),100K 档零回退(decode 还略升 106.8→112.0),131072 日常档与 256K 档共用同一草稿副本无冲突。
+
+**256K 终态测速**(单流 261K realtext / 工具口径,终态配置全文 [`patch/launch_dspine_256k.sh`](patch/launch_dspine_256k.sh),diff 见 [`patch/yarn-draft-config.md`](patch/yarn-draft-config.md),报告 [`docs/dspine-256k-optimize.md`](docs/dspine-256k-optimize.md)):
+
+| 口径 | prefill tps | decode tps | TTFT | 显存峰值 |
+|---|---|---|---|---|
+| realtext 261383 tok | 1133 | **74.3 / 82.6(两轮)** | 231 s | — |
+| 工具随机词 261268 tok | 1127 | 37.2(无 yarn 时 23.2,+60%) | 232 s | 64611 MiB(剩 ~600 MiB) |
+
+对照裸跑 AR 256K decode 36.7 tps:投机收益 ×2;输出质量抽检(261K 输入 512 token 总结)结构完整无乱码,样本见 [`experiments/kvqual-yarn256k.json`](experiments/kvqual-yarn256k.json)。
+
+**KV 量化路线在此栈上是架构性死路,如实放弃**:DSpine SPS 验证硬要求主后端带 ragged 旗标,而 SM80 上唯一满足的后端 fa3 只吃 bf16/fp16 KV——**ragged 旗标 × Ampere FA dtype 交集为空**,与档位无关,升级版本绕不开。裸栈(无投机)fp8 KV 三档对比已留档(池 3.5×、e4m3 精度几乎无损),待 Hopper 硬件或上游补 ragged 后端后可直接选 e4m3(死因链与三档数据:[`docs/dspine-256k-optimize.md`](docs/dspine-256k-optimize.md) A 节,原始四枪日志 [`experiments/`](experiments/))。
+
 ## SPS 调优(负结果,已回退)
 
 修完长上下文后,按 DSpine 官方 `tune_sps.py` 流程把 SPS 验证宽度表完整调了一遍(约 3 小时全程,负结果如实收录,同硬件同学可免重试):
@@ -70,19 +89,20 @@ transformers==5.19.0  triton==3.8.0        Python 3.12
 
 | 路径 | 内容 |
 |---|---|
-| [`docs/`](docs/) | 12 份报告原文(时间序):调研方案 → 模型下载验收 → 部署日志(五关) → DFlash2 基线测速 → DSpine 修复前测速(崩盘) → 裸跑 AR 对照 → 真实负载数据 → 五负载裁决(verdict2) → 外部调研(根因 Top3+官方口径) → **长上下文修复报告** → 测速工具填法 → **SPS 调优(负结果)** |
+| [`docs/`](docs/) | 14 份报告原文(时间序):调研方案 → 模型下载验收 → 部署日志(五关) → DFlash2 基线测速 → DSpine 修复前测速(崩盘) → 裸跑 AR 对照 → 真实负载数据 → 五负载裁决(verdict2) → 外部调研(根因 Top3+官方口径) → **长上下文修复报告** → 测速工具填法 → **SPS 调优(负结果)** → **256K 极限首测(降级链)** → **256K 优化(YARN 修复+量化死因)** |
+| [`experiments/`](experiments/) | 256K 优化 16 件原始实验日志:A 轮 KV 量化四枪死因日志 + 裸栈三档对比与质量样本(`kvqual-*.json`)· B 轮滑窗扫描 · C 轮 YARN 服务日志 · D 轮显存采样 · `README.md` 逐件索引 |
 | [`tuning/`](tuning/) | SPS 调优全部原始产物(负结果):最终表 `dspine-sps-table.json` · 校准语料与构建脚本 · 调优器日志 · 逐候选测量原始数据(`runs/`)· 带表/终态无表服务日志 · 前后对比 bench 与 metrics 快照 |
-| [`patch/`](patch/) | 两枚真实 diff:长上下文滑窗修复(config+WINDOW 常量)· SM80 FP8 粗检索 BF16 回退 |
+| [`patch/`](patch/) | 四件:两枚真实 diff(长上下文滑窗修复 · SM80 FP8 粗检索 BF16 回退)+ **256K YARN 草稿 config 增量(`yarn-draft-config.md`)** + **256K 终态启动脚本(`launch_dspine_256k.sh`)** |
 | [`screenshots/`](screenshots/) | `final-benchmark-user.png` 用户实测截图 · `tool-howto-fullpage.png` / `tool-howto-closeup.png` 网页测速工具跑通与填法 |
-| [`data/bench-tool-results.jsonl`](data/bench-tool-results.jsonl) | 全程 97 行原始测速数据(DFlash2 基线 / DSpine 修复前后 / 裸跑 AR / 裁决 / 最终验证 / SPS 调优前后,tag 分段) |
+| [`data/bench-tool-results.jsonl`](data/bench-tool-results.jsonl) | 全程 106 行原始测速数据(DFlash2 基线 / DSpine 修复前后 / 裸跑 AR / 裁决 / 最终验证 / SPS 调优前后 / 256K 首测 / 256K 优化 B·C·D 轮,tag 分段) |
 
 ## 已知限制(如实)
 
 - **FP8 底模偏离官方 BF16 口径**:官方 benchmark 全部 BF16+FA3+未知 GPU(3.33× 不可平移绝对值);本机 FP8-on-SM80 走 Marlin 反量化路径。实测短上下文接受率 7.28–12.28 已达官方量级(GSM8K T0 官方 7.20)。
 - **SM80 无真 FA3**:插件锁字面 `fa3`,sglang-kernel 的 fa3 后端在 Ampere 走包装内核(非 Hopper-only 的裸 FA3),属官方未测试组合;正因此踩到滑窗掩码分支的坑(也是本仓库核心发现)。
-- **mamba 16 槽钳并发**:官方 64 槽在 64G 卡装不下(mamba fp32×16 槽被 ReplaySSM 按每请求 5 槽吃),实际并发上限 3(非 8);bf16 KV 使 token 预算 174,870、上下文显式压到 131072。
+- **mamba 16 槽钳并发**:官方 64 槽在 64G 卡装不下(mamba fp32×16 槽被 ReplaySSM 按每请求 5 槽吃),实际并发上限 3(非 8);bf16 KV 使 token 预算 174,870、上下文显式压到 131072。256K 档换 mamba 8 槽 + mf 0.90 把预算抬到 262,688,但并发上限降为 1(单流专用档)。
 - 接受率对语料敏感:code 12–16 / 数学 7.5 / 英文 realtext 4–5 / 中文叙事 ~2——创作型负载投机收益有限,负载画像决定选型。
 
 ## 复现
 
-所有数字均为 2026-11-09 单机实测,原始数据、启动参数全文、验证方法与脚本口径都在本仓库;`patch/` 可直接应用。同硬件同学欢迎按 `docs/` 时间线复跑对照,对上游(sgl-project/sglang、Tencent/DSpine)报 issue 时可直接引用 `data/` 与 `patch/` 的证据链(边界=窗口值、窗口放大即愈、num_splits=1 无效)。SPS 调优流程与判定口径见 [`tuning/README.md`](tuning/README.md)。
+所有数字均为 2026-11-09/10 单机实测,原始数据、启动参数全文、验证方法与脚本口径都在本仓库;`patch/` 可直接应用。同硬件同学欢迎按 `docs/` 时间线复跑对照,对上游(sgl-project/sglang、Tencent/DSpine)报 issue 时可直接引用 `data/`、`experiments/` 与 `patch/` 的证据链(滑窗:边界=窗口值、窗口放大即愈、num_splits=1 无效;256K:rope 外推=YARN 可修、`rope_scaling` 顶层字段不被读、KV 量化 ragged×Ampere dtype 交集为空)。SPS 调优流程与判定口径见 [`tuning/README.md`](tuning/README.md),256K 实验逐件索引见 [`experiments/README.md`](experiments/README.md)。
